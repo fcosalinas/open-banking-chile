@@ -16,6 +16,31 @@ export type ScrapeFn = (
  * 5. Logout + close browser
  * 6. Catch errors → return ScrapeResult
  */
+/**
+ * Con `OBC_DUMP_XHR` activo, deja el navegador abierto `OBC_DUMP_PAUSE_SEC`
+ * segundos antes de cerrar sesion.
+ *
+ * El volcado solo puede capturar lo que la pagina pide, y el scraper no visita
+ * todo: si una seccion necesita un clic que el no da -elegir otra tarjeta, por
+ * ejemplo-, su endpoint no aparece nunca. La pausa permite navegar a mano esa
+ * parte con el interceptor puesto, que es como se descubre que parametro
+ * distingue lo que falta.
+ */
+async function pauseForDump(
+  debugLog: string[],
+  onDebug?: (line: string) => void,
+): Promise<void> {
+  if (!process.env.OBC_DUMP_XHR?.trim()) return;
+  const raw = parseInt(process.env.OBC_DUMP_PAUSE_SEC || "0", 10) || 0;
+  const seconds = Math.min(Math.max(raw, 0), 600);
+  if (seconds === 0) return;
+
+  const message = `Volcado XHR: navegador abierto ${seconds}s para explorar a mano.`;
+  debugLog.push(message);
+  onDebug?.(message);
+  await new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+}
+
 export async function runScraper(
   bankId: string,
   options: ScraperOptions,
@@ -41,7 +66,9 @@ export async function runScraper(
       !!saveScreenshots,
     );
 
-    return await scrapeFn(session, options);
+    const result = await scrapeFn(session, options);
+    await pauseForDump(session.debugLog, onDebug);
+    return result;
   } catch (error) {
     return {
       success: false,

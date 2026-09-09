@@ -1,8 +1,15 @@
 import type { Frame, Page } from "puppeteer-core";
-import type { BankMovement, BankScraper, ScrapeResult, ScraperOptions } from "../types.js";
+import type {
+  BankMovement,
+  BankScraper,
+  CardOwner,
+  CreditCardBalance,
+  ScrapeResult,
+  ScraperOptions,
+} from "../types.js";
 import { MOVEMENT_SOURCE } from "../types.js";
 import { deduplicateMovements, closePopups, delay, normalizeDate, parseChileanAmount } from "../utils.js";
-import { createInterceptor } from "../intercept.js";
+import { createInterceptor, type Interceptor } from "../intercept.js";
 import { runScraper } from "../infrastructure/scraper-runner.js";
 import type { BrowserSession } from "../infrastructure/browser.js";
 import { fillRut, fillPassword, clickSubmit, detectLoginError } from "../actions/login.js";
@@ -24,6 +31,15 @@ const SANTANDER_CC_API_PREFIX =
   "https://api-dsk.santander.cl/perdsk/tarjetasDeCredito/consultaUltimosMovimientos";
 const SANTANDER_CC_BILLED_API_PREFIX =
   "https://api-dsk.santander.cl/perdsk/tarjetasDeCredito/estadoCuentaNacional";
+// Lista de plasticos del cliente: de aca salen las coordenadas
+// (entidad/centro/cuenta) con las que se le puede preguntar al banco por cada
+// tarjeta. Sin esto solo se ve la que el portal muestra por omision.
+const SANTANDER_CARDS_API_PREFIX =
+  "https://openbanking.santander.cl/card_authorization/card_authorization/v1/cards/card_devices_management";
+// Extractos disponibles de una tarjeta: el numero de extracto es obligatorio
+// para pedir los movimientos facturados.
+const SANTANDER_CC_STATEMENTS_API_PREFIX =
+  "https://api-dsk.santander.cl/perdsk/tarjetasDeCredito/cuentasDisponibles";
 
 // ─── API response normalizers ────────────────────────────────────
 
@@ -52,8 +68,13 @@ export function normalizeSantanderCheckingApiMovements(captures: unknown[]): Ban
       const description = (m.observation?.trim() || m.expandedCode?.trim() || "").trim();
       let balance = 0;
       if (m.newBalance) {
+        // El signo va al final, igual que en movementAmount. Sin esto, la
+        // cuenta en rojo -saldo negativo que la linea de credito rellena- se
+        // lee como si tuviera plata, y la cadena de saldos se parte en cada uno.
+        const negative = m.newBalance.trim().endsWith("-");
         const balDigits = m.newBalance.replace(/[^0-9]/g, "");
         balance = Math.round(parseInt(balDigits, 10) / 100);
+        if (negative) balance = -balance;
       }
       movements.push({
         date: normalizeDate(m.transactionDate),
@@ -73,13 +94,17 @@ interface SantanderCcApiMovement {
   Descripcion: string;
   Importe: string; // "3.990" (Chilean thousands)
   IndicadorDebeHaber: string; // "D" = debit, "H" = credit
+  TipoBen?: string | null; // "Titular" | null — quien hizo la compra
 }
 
 export function isSaldoInicial(description: string): boolean {
   return /saldo\s+inicial/i.test(description);
 }
 
-export function normalizeSantanderUnbilledApiMovements(captures: unknown[]): BankMovement[] {
+export function normalizeSantanderUnbilledApiMovements(
+  captures: unknown[],
+  card?: string,
+): BankMovement[] {
   const movements: BankMovement[] = [];
   for (const capture of captures) {
     const obj = capture as { DATA?: { MatrizMovimientos?: SantanderCcApiMovement[] } };
@@ -92,12 +117,18 @@ export function normalizeSantanderUnbilledApiMovements(captures: unknown[]): Ban
       const amount = isDebit ? -raw : raw;
       const description = (m.Comercio?.trim() || m.Descripcion?.trim() || "").trim();
       if (isSaldoInicial(description)) continue;
+      // Los no facturados no traen PAN: la tarjeta es la de la consulta. El
+      // banco si dice si la compra es del titular o de un adicional.
+      const owner: CardOwner | undefined =
+        m.TipoBen == null ? undefined : /titular/i.test(m.TipoBen) ? "titular" : "adicional";
       movements.push({
         date: normalizeDate(m.Fecha),
         description,
         amount,
         balance: 0,
         source: MOVEMENT_SOURCE.credit_card_unbilled,
+        ...(card ? { card } : {}),
+        ...(owner ? { owner } : {}),
       });
     }
   }
@@ -110,6 +141,13 @@ interface SantanderBilledApiMovement {
   MontoTxs: string; // "0000833685" or "50.000" (Chilean thousands, leading zeros)
   NumeroCuotas: string; // "00"
   TotalCuotas: string; // "00"
+  Pan?: string; // "240004#375833608" — el plastico que hizo la compra
+}
+
+/** Ultimos cuatro digitos del PAN, que es como se nombra una tarjeta. */
+export function maskOfPan(pan: string | undefined): string | undefined {
+  const digits = (pan || "").replace(/[^0-9]/g, "");
+  return digits.length >= 4 ? digits.slice(-4) : undefined;
 }
 
 export function normalizeSantanderBilledApiMovements(captures: unknown[]): BankMovement[] {
@@ -136,17 +174,232 @@ export function normalizeSantanderBilledApiMovements(captures: unknown[]): BankM
         totalCuotas > 0
           ? `${String(currentCuota).padStart(2, "0")}/${String(totalCuotas).padStart(2, "0")}`
           : undefined;
+      const card = maskOfPan(m.Pan);
       movements.push({
         date: normalizeDate(m.FechaTxs),
         description: m.NombreComercio,
         amount,
         balance: 0,
         source: MOVEMENT_SOURCE.credit_card_billed,
+        ...(card ? { card } : {}),
         ...(installments ? { installments } : {}),
       });
     }
   }
   return movements;
+}
+
+// ─── Tarjetas: lista de plasticos y extractos ────────────────────
+
+interface SantanderCardDevice {
+  debitOrCreditCard?: string;
+  entityCode?: string;
+  emissionCenter?: string;
+  accountNumber?: string;
+  cardNumber?: string;
+  beneficiaryNumber?: string;
+  productComment?: string;
+  limitCenterPesos?: string;
+  limitContractUSD?: string;
+  cardStatusComment?: string;
+}
+
+/** Una tarjeta con las coordenadas que el banco pide para consultarla. */
+export interface SantanderCard {
+  entity: string;
+  center: string;
+  account: string;
+  /** Ultimos cuatro digitos del plastico. */
+  mask: string;
+  label: string;
+  owner: CardOwner;
+  /** Cupo nacional en pesos, si lo declara la lista de plasticos. */
+  limitClp?: number;
+  /** Cupo internacional en dolares. */
+  limitUsd?: number;
+}
+
+/**
+ * Tarjetas del cliente, con la entidad/centro/cuenta que las identifica.
+ *
+ * Varios plasticos comparten cuenta -el titular y sus adicionales- y los
+ * movimientos se consultan por cuenta, no por plastico.
+ */
+export function parseSantanderCards(captures: unknown[]): SantanderCard[] {
+  const cards: SantanderCard[] = [];
+  for (const capture of captures) {
+    const list = (capture as { output?: SantanderCardDevice[] })?.output;
+    if (!Array.isArray(list)) continue;
+    for (const device of list) {
+      if (device.debitOrCreditCard && device.debitOrCreditCard !== "C") continue;
+      const mask = maskOfPan(device.cardNumber);
+      const account = device.accountNumber?.trim();
+      const center = device.emissionCenter?.trim();
+      const entity = device.entityCode?.trim();
+      if (!mask || !account || !center || !entity) continue;
+      const name = device.productComment?.trim() || "Tarjeta de crédito";
+      cards.push({
+        entity,
+        center,
+        account,
+        mask,
+        label: `${name} ****${mask}`,
+        // El primer beneficiario es el titular; el resto son adicionales.
+        owner:
+          (device.beneficiaryNumber || "").replace(/^0+/, "") === "1" ? "titular" : "adicional",
+        ...(device.limitCenterPesos ? { limitClp: parseInt(device.limitCenterPesos, 10) || 0 } : {}),
+        ...(device.limitContractUSD
+          ? { limitUsd: Math.round((parseInt(device.limitContractUSD, 10) || 0) / 100) }
+          : {}),
+      });
+    }
+  }
+  return cards;
+}
+
+/** Una entrada por cuenta de tarjeta, con el plastico del titular de cara. */
+export function cardAccounts(cards: SantanderCard[]): SantanderCard[] {
+  const byAccount = new Map<string, SantanderCard>();
+  for (const card of cards) {
+    const key = `${card.entity}|${card.center}|${card.account}`;
+    const current = byAccount.get(key);
+    if (!current || (current.owner === "adicional" && card.owner === "titular")) {
+      byAccount.set(key, card);
+    }
+  }
+  return [...byAccount.values()];
+}
+
+interface SantanderStatementRef {
+  NUMEXT?: string;
+  FECHAEXT?: string;
+  MONEDA?: string;
+}
+
+/** Numero del ultimo extracto en pesos, que es el que se pide facturado. */
+export function latestStatementNumber(capture: unknown): string | undefined {
+  const matrix = (
+    capture as {
+      DATA?: {
+        AS_TIB_WM01_CONCuentasDisponibles?: { OUTPUT?: { MATRIZ?: SantanderStatementRef[] } };
+      };
+    }
+  )?.DATA?.AS_TIB_WM01_CONCuentasDisponibles?.OUTPUT?.MATRIZ;
+  if (!Array.isArray(matrix)) return undefined;
+  // 152 es CLP en el codigo de moneda del banco; 840 es el extracto en dolares.
+  const clp = matrix.filter((row) => (row.MONEDA || "152") === "152" && row.NUMEXT);
+  if (clp.length === 0) return undefined;
+  clp.sort((a, b) => (a.FECHAEXT || "").localeCompare(b.FECHAEXT || ""));
+  return clp[clp.length - 1].NUMEXT;
+}
+
+interface SantanderStatementHeader {
+  CupoPesos?: string;
+  MontoUtilizado?: string;
+  CupoDisponible?: string;
+  FechaFactActual?: string;
+  FechaVenc?: string;
+  FechaProxFact?: string;
+  DeudaTotalFact?: string;
+  PagoMinimo?: string;
+}
+
+function statementHeader(capture: unknown): SantanderStatementHeader | undefined {
+  return (
+    capture as {
+      DATA?: {
+        AS_TIB_WM02_CONEstCtaNacional_Response?: {
+          OUTPUT?: { RESPUESTA?: SantanderStatementHeader };
+        };
+      };
+    }
+  )?.DATA?.AS_TIB_WM02_CONEstCtaNacional_Response?.OUTPUT?.RESPUESTA;
+}
+
+/** Entero en pesos; el banco los manda con ceros a la izquierda. */
+function statementAmount(raw: string | undefined): number | undefined {
+  if (!raw) return undefined;
+  const digits = raw.replace(/[^0-9]/g, "");
+  if (!digits) return undefined;
+  const value = parseInt(digits, 10);
+  return raw.trim().endsWith("-") ? -value : value;
+}
+
+/**
+ * Cupos y estado de cuenta de una tarjeta, leidos del encabezado del extracto.
+ *
+ * Es la unica fuente que trae cupo, deuda facturada, pago minimo y las tres
+ * fechas del ciclo. El portal las muestra, pero solo si se le pide el extracto.
+ */
+export function buildSantanderCreditCard(
+  card: SantanderCard,
+  billedCapture: unknown,
+  unbilled: BankMovement[],
+): CreditCardBalance {
+  const header = statementHeader(billedCapture);
+  const total = statementAmount(header?.CupoPesos) ?? card.limitClp;
+  const used = statementAmount(header?.MontoUtilizado);
+  const available = statementAmount(header?.CupoDisponible);
+  const billedAmount = statementAmount(header?.DeudaTotalFact);
+  const billingDate = header?.FechaFactActual ? normalizeDate(header.FechaFactActual) : undefined;
+  const dueDate = header?.FechaVenc ? normalizeDate(header.FechaVenc) : undefined;
+  const minimumPayment = statementAmount(header?.PagoMinimo);
+  const periodExpenses = unbilled
+    .filter((m) => m.amount < 0)
+    .reduce((sum, m) => sum + Math.abs(m.amount), 0);
+
+  return {
+    label: card.label,
+    ...(total !== undefined && used !== undefined && available !== undefined
+      ? { national: { used, available, total } }
+      : {}),
+    ...(header?.FechaProxFact ? { nextBillingDate: normalizeDate(header.FechaProxFact) } : {}),
+    ...(periodExpenses > 0 ? { periodExpenses } : {}),
+    ...(billingDate && dueDate && billedAmount !== undefined
+      ? {
+          lastStatement: {
+            billingDate,
+            billedAmount,
+            dueDate,
+            ...(minimumPayment !== undefined ? { minimumPayment } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+/** Reemplaza las coordenadas de tarjeta en el cuerpo grabado de una peticion. */
+export function withCardCoordinates(
+  template: unknown,
+  card: SantanderCard,
+  extra: Record<string, string> = {},
+): unknown {
+  if (!template || typeof template !== "object") return template;
+  const clone = JSON.parse(JSON.stringify(template)) as Record<string, unknown>;
+  // Los tres endpoints nombran los mismos campos de forma distinta.
+  const equivalents: Record<string, string> = {
+    entidad: card.entity,
+    codent: card.entity,
+    codentidad: card.entity,
+    centro: card.center,
+    centalt: card.center,
+    centroalt: card.center,
+    cuenta: card.account,
+    ...Object.fromEntries(Object.entries(extra).map(([key, value]) => [key.toLowerCase(), value])),
+  };
+
+  const patch = (node: Record<string, unknown>): void => {
+    for (const [key, value] of Object.entries(node)) {
+      if (value && typeof value === "object") {
+        patch(value as Record<string, unknown>);
+        continue;
+      }
+      const replacement = equivalents[key.toLowerCase()];
+      if (replacement !== undefined) node[key] = replacement;
+    }
+  };
+  patch(clone);
+  return clone;
 }
 
 // Sidebar menu IDs — generated by Santander's Angular framework, may change
@@ -314,6 +567,84 @@ async function navigateToCreditCardSection(page: Page, debugLog: string[]): Prom
   return page.url().toLowerCase().includes("saldos_tc");
 }
 
+/**
+ * Movimientos y cupos de **todas** las tarjetas, no solo la que el portal abre.
+ *
+ * La interfaz muestra una tarjeta a la vez y el scraper solo veia esa: en una
+ * cuenta con tres tarjetas, dos quedaban invisibles enteras -y con ellas sus
+ * compras, sus cuotas y su deuda-. Cambiar de tarjeta en el carrusel no es
+ * viable: depende de selectores que el banco cambia sin avisar.
+ *
+ * En vez de eso se repite la peticion que la propia pagina acaba de hacer,
+ * cambiandole las coordenadas de la tarjeta. La sesion y las cabeceras son las
+ * suyas, asi que el banco responde lo mismo que si el usuario hubiera hecho el
+ * clic. Por cada tarjeta hacen falta tres: los no facturados, la lista de
+ * extractos -el numero es obligatorio para pedir lo facturado- y el extracto.
+ *
+ * Si no hay plantilla que repetir devuelve vacio, y el scraper se queda con lo
+ * que capturo de la tarjeta visible.
+ */
+async function collectAllCards(
+  interceptor: Interceptor,
+  cards: SantanderCard[],
+  debugLog: string[],
+  progress: (step: string) => void,
+): Promise<{ movements: BankMovement[]; creditCards: CreditCardBalance[] }> {
+  const movements: BankMovement[] = [];
+  const creditCards: CreditCardBalance[] = [];
+
+  const unbilledTemplate = interceptor.lastRequestBody("santander-credit-card-unbilled");
+  if (cards.length === 0 || unbilledTemplate === undefined) {
+    debugLog.push(
+      `  Multi-tarjeta: sin ${cards.length === 0 ? "lista de tarjetas" : "plantilla de consulta"}.`,
+    );
+    return { movements, creditCards };
+  }
+
+  const statementsTemplate = interceptor.lastRequestBody("santander-cc-statements");
+  const billedTemplate = interceptor.lastRequestBody("santander-credit-card-billed");
+  debugLog.push(`  Multi-tarjeta: ${cards.length} tarjeta(s) por consultar.`);
+
+  for (const card of cards) {
+    progress(`Extrayendo tarjeta ****${card.mask}...`);
+
+    const unbilledCapture = await interceptor.replay(
+      "santander-credit-card-unbilled",
+      withCardCoordinates(unbilledTemplate, card),
+    );
+    const unbilled = unbilledCapture
+      ? normalizeSantanderUnbilledApiMovements([unbilledCapture], card.mask)
+      : [];
+    movements.push(...unbilled);
+
+    let billedCapture: unknown;
+    if (statementsTemplate !== undefined && billedTemplate !== undefined) {
+      const statements = await interceptor.replay(
+        "santander-cc-statements",
+        withCardCoordinates(statementsTemplate, card),
+      );
+      const statementNumber = statements ? latestStatementNumber(statements) : undefined;
+      if (statementNumber) {
+        billedCapture = await interceptor.replay(
+          "santander-credit-card-billed",
+          withCardCoordinates(billedTemplate, card, { NumExtracto: statementNumber }),
+        );
+        if (billedCapture) {
+          movements.push(...normalizeSantanderBilledApiMovements([billedCapture]));
+        }
+      }
+    }
+
+    creditCards.push(buildSantanderCreditCard(card, billedCapture, unbilled));
+    debugLog.push(
+      `  ****${card.mask}: ${unbilled.length} por facturar, ` +
+        `${billedCapture ? "extracto leido" : "sin extracto"}.`,
+    );
+  }
+
+  return { movements, creditCards };
+}
+
 // ─── Main scrape function ────────────────────────────────────────────
 
 async function scrapeSantander(
@@ -330,6 +661,8 @@ async function scrapeSantander(
     { id: "santander-checking", urlPrefix: SANTANDER_CHECKING_API_PREFIX },
     { id: "santander-credit-card-unbilled", urlPrefix: SANTANDER_CC_API_PREFIX },
     { id: "santander-credit-card-billed", urlPrefix: SANTANDER_CC_BILLED_API_PREFIX },
+    { id: "santander-cards", urlPrefix: SANTANDER_CARDS_API_PREFIX },
+    { id: "santander-cc-statements", urlPrefix: SANTANDER_CC_STATEMENTS_API_PREFIX },
   ]);
 
   // 1. Navigate
@@ -469,31 +802,42 @@ async function scrapeSantander(
   debugLog.push("7b. Navigating to credit card movements...");
   progress("Extrayendo movimientos de tarjeta de crédito...");
   const tcReady = await navigateToCreditCardSection(page, debugLog);
+  let creditCards: CreditCardBalance[] = [];
   if (tcReady) {
-    if (await clickTcTab(page, "movimientos por facturar")) {
-      const unbilledCaptures = await interceptor.waitFor("santander-credit-card-unbilled", 10_000);
+    // Las dos pestanas se visitan igual que antes, pero no por sus datos: de
+    // aca salen las plantillas de peticion -URL, cabeceras y cuerpo- que
+    // despues se repiten para cada tarjeta.
+    const unbilledCaptures = (await clickTcTab(page, "movimientos por facturar"))
+      ? await interceptor.waitFor("santander-credit-card-unbilled", 10_000)
+      : [];
+    const billedCaptures = (await clickTcTab(page, "movimientos facturados"))
+      ? await interceptor.waitFor("santander-credit-card-billed", 10_000)
+      : [];
+
+    const cards = cardAccounts(parseSantanderCards(interceptor.getAll("santander-cards")));
+    const perCard = await collectAllCards(interceptor, cards, debugLog, progress);
+
+    if (perCard.movements.length > 0) {
+      movements.push(...perCard.movements);
+      creditCards = perCard.creditCards;
+    } else {
+      // Sin plantilla o sin lista de tarjetas queda lo de siempre: la tarjeta
+      // que el portal muestre por omision.
       if (unbilledCaptures.length > 0) {
-        const unbilledMovements = normalizeSantanderUnbilledApiMovements(unbilledCaptures);
-        movements.push(...unbilledMovements);
-        debugLog.push(`  CC API (unbilled): ${unbilledMovements.length} movement(s)`);
+        const unbilled = normalizeSantanderUnbilledApiMovements(unbilledCaptures);
+        movements.push(...unbilled);
+        debugLog.push(`  CC API (unbilled): ${unbilled.length} movement(s)`);
       } else {
         debugLog.push("  CC API (unbilled): no data, falling back to HTML extraction");
-        const unbilled = await extractCreditCardMovements(page, "unbilled");
-        movements.push(...unbilled);
-        debugLog.push(`  TC por facturar: ${unbilled.length} movement(s)`);
+        movements.push(...(await extractCreditCardMovements(page, "unbilled")));
       }
-    }
-    if (await clickTcTab(page, "movimientos facturados")) {
-      const billedCaptures = await interceptor.waitFor("santander-credit-card-billed", 10_000);
       if (billedCaptures.length > 0) {
-        const billedMovements = normalizeSantanderBilledApiMovements(billedCaptures);
-        movements.push(...billedMovements);
-        debugLog.push(`  CC API (billed): ${billedMovements.length} movement(s)`);
+        const billed = normalizeSantanderBilledApiMovements(billedCaptures);
+        movements.push(...billed);
+        debugLog.push(`  CC API (billed): ${billed.length} movement(s)`);
       } else {
         debugLog.push("  CC API (billed): no data, falling back to HTML extraction");
-        const billed = await extractCreditCardMovements(page, "billed");
-        movements.push(...billed);
-        debugLog.push(`  TC facturados: ${billed.length} movement(s)`);
+        movements.push(...(await extractCreditCardMovements(page, "billed")));
       }
     }
   } else {
@@ -519,7 +863,14 @@ async function scrapeSantander(
   await doSave(page, "05-final");
   const ss = doScreenshots ? ((await page.screenshot({ encoding: "base64", fullPage: true })) as string) : undefined;
 
-  return { success: true, bank, accounts: [{ balance, movements }], screenshot: ss, debug: debugLog.join("\n") };
+  return {
+    success: true,
+    bank,
+    accounts: [{ balance, movements }],
+    ...(creditCards.length > 0 ? { creditCards } : {}),
+    screenshot: ss,
+    debug: debugLog.join("\n"),
+  };
 }
 
 // ─── Export ──────────────────────────────────────────────────────────

@@ -3,6 +3,14 @@ import { join } from "node:path";
 
 import type { Page } from "puppeteer-core";
 
+/** Una petición tal como la hizo la página, para poder repetirla. */
+interface RecordedRequest {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body?: string;
+}
+
 export interface EndpointConfig {
   /** Unique identifier used to retrieve captured data */
   id: string;
@@ -26,6 +34,8 @@ export interface EndpointConfig {
 const DUMP_DIR = process.env.OBC_DUMP_XHR?.trim() || "";
 /** Id reservado del puente para el volcado: no es un endpoint del scraper. */
 const DUMP_ID = "__obc_dump__";
+/** Id reservado del puente para las peticiones grabadas. */
+const REQUEST_ID = "__obc_request__";
 
 function hostsOf(endpoints: EndpointConfig[]): string[] {
   const hosts = new Set<string>();
@@ -59,6 +69,23 @@ export interface Interceptor {
    * Returns the captured responses, or an empty array if the timeout is reached.
    */
   waitFor(id: string, timeoutMs?: number): Promise<unknown[]>;
+  /**
+   * Cuerpo de la última petición que la propia página hizo a ese endpoint, ya
+   * parseado. Sirve de plantilla: se le cambia lo que distingue un producto de
+   * otro y se vuelve a pedir con `replay`.
+   */
+  lastRequestBody(id: string): unknown | undefined;
+  /**
+   * Repite una petición del endpoint con otro cuerpo, desde la propia página.
+   *
+   * Reutiliza URL, método y cabeceras tal como los mandó la aplicación del
+   * banco, así que la sesión y cualquier token viajan sin que el scraper tenga
+   * que saber cómo se autentica. Es la forma de pedir lo que la interfaz nunca
+   * pide sola: el resto de las tarjetas, otro extracto, la otra moneda.
+   *
+   * Devuelve la respuesta JSON, o `undefined` si no hay plantilla o si falló.
+   */
+  replay(id: string, body: unknown): Promise<unknown | undefined>;
 }
 
 /**
@@ -76,6 +103,7 @@ export async function createInterceptor(
   endpoints: EndpointConfig[],
 ): Promise<Interceptor> {
   const captures = new Map<string, unknown[]>();
+  const requests = new Map<string, RecordedRequest>();
 
   if (DUMP_DIR) mkdirSync(DUMP_DIR, { recursive: true, mode: 0o700 });
   let dumped = 0;
@@ -84,6 +112,20 @@ export async function createInterceptor(
   await page.exposeFunction(
     "__obcCapture",
     (id: string, dataJson: string) => {
+      if (id === REQUEST_ID) {
+        try {
+          const recorded = JSON.parse(dataJson) as { endpointId: string } & RecordedRequest;
+          requests.set(recorded.endpointId, {
+            url: recorded.url,
+            method: recorded.method,
+            headers: recorded.headers,
+            body: recorded.body,
+          });
+        } catch {
+          // Sin plantilla no hay replay; el scraper sigue con lo que capturo.
+        }
+        return;
+      }
       if (id === DUMP_ID) {
         if (!DUMP_DIR) return;
         try {
@@ -111,6 +153,7 @@ export async function createInterceptor(
       const config = JSON.parse(configJson) as {
         endpoints: Array<{ id: string; urlPrefix: string }>;
         dumpId: string;
+        requestId: string;
         dumpHosts: string[];
       };
       const eps = config.endpoints;
@@ -139,6 +182,45 @@ export async function createInterceptor(
         }
       }
 
+      /** Cabeceras que el navegador no deja fijar a mano al repetir la peticion. */
+      const FORBIDDEN = [
+        "host", "connection", "content-length", "cookie", "origin", "referer", "user-agent",
+      ];
+
+      function plainHeaders(raw: unknown): Record<string, string> {
+        const out: Record<string, string> = {};
+        const add = (key: string, value: string): void => {
+          if (!FORBIDDEN.includes(key.toLowerCase())) out[key] = value;
+        };
+        if (raw instanceof Headers) {
+          raw.forEach((value, key) => add(key, value));
+        } else if (Array.isArray(raw)) {
+          for (const [key, value] of raw as Array<[string, string]>) add(key, String(value));
+        } else if (raw && typeof raw === "object") {
+          for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+            add(key, String(value));
+          }
+        }
+        return out;
+      }
+
+      /** Guarda la peticion tal como la mando el banco, para poder repetirla. */
+      function recordRequest(
+        endpointId: string,
+        url: string,
+        method: string,
+        headers: unknown,
+        body: unknown,
+      ): void {
+        capture(config.requestId, {
+          endpointId,
+          url,
+          method,
+          headers: plainHeaders(headers),
+          body: typeof body === "string" ? body : undefined,
+        });
+      }
+
       function dump(url: string, method: string, requestBody: unknown, response: unknown): void {
         capture(config.dumpId, {
           url,
@@ -159,6 +241,12 @@ export async function createInterceptor(
 
       // ── Wrap fetch ──────────────────────────────────────────────
       const originalFetch = window.fetch;
+      // El replay usa este: repetir por el fetch envuelto se capturaria a si
+      // mismo y contaria los movimientos dos veces.
+      Object.defineProperty(window, "__obcFetch", {
+        value: originalFetch.bind(window),
+        configurable: true,
+      });
       window.fetch = async function (...args: Parameters<typeof fetch>): Promise<Response> {
         const url =
           typeof args[0] === "string"
@@ -173,6 +261,7 @@ export async function createInterceptor(
         if (ep || shouldDump(url)) {
           const init = (args[1] || {}) as RequestInit;
           const method = (init.method || (args[0] instanceof Request ? args[0].method : "GET")).toUpperCase();
+          if (ep) recordRequest(ep.id, url, method, init.headers, init.body);
           response
             .clone()
             .json()
@@ -203,6 +292,14 @@ export async function createInterceptor(
         return origOpen.apply(this, [method, url, ...rest] as Parameters<typeof origOpen>);
       };
 
+      const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+      XMLHttpRequest.prototype.setRequestHeader = function (name: string, value: string): void {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const self = this as any;
+        self.__obcHeaders = { ...(self.__obcHeaders || {}), [name]: value };
+        return origSetHeader.apply(this, [name, value]);
+      };
+
       XMLHttpRequest.prototype.send = function (
         ...args: Parameters<typeof origSend>
       ): void {
@@ -211,6 +308,9 @@ export async function createInterceptor(
         const ep = self.__obcEp as { id: string } | undefined;
         const url = (self.__obcUrl as string) || "";
         const requestBody = args[0];
+        if (ep) {
+          recordRequest(ep.id, url, (self.__obcMethod as string) || "GET", self.__obcHeaders, requestBody);
+        }
         if (ep || shouldDump(url)) {
           this.addEventListener("load", function (this: XMLHttpRequest) {
             try {
@@ -231,6 +331,7 @@ export async function createInterceptor(
     JSON.stringify({
       endpoints,
       dumpId: DUMP_ID,
+      requestId: REQUEST_ID,
       dumpHosts: DUMP_DIR ? hostsOf(endpoints) : [],
     }),
   );
@@ -242,6 +343,40 @@ export async function createInterceptor(
   return {
     getAll(id: string): unknown[] {
       return captures.get(id) ?? [];
+    },
+
+    lastRequestBody(id: string): unknown | undefined {
+      const recorded = requests.get(id);
+      if (!recorded?.body) return undefined;
+      try {
+        return JSON.parse(recorded.body);
+      } catch {
+        return undefined;
+      }
+    },
+
+    async replay(id: string, body: unknown): Promise<unknown | undefined> {
+      const recorded = requests.get(id);
+      if (!recorded) return undefined;
+      try {
+        return await page.evaluate(
+          async (request: RecordedRequest, bodyJson: string) => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const rawFetch = (window as any).__obcFetch as typeof fetch;
+            const response = await rawFetch(request.url, {
+              method: request.method,
+              headers: request.headers,
+              body: bodyJson,
+              credentials: "include",
+            });
+            return (await response.json()) as unknown;
+          },
+          recorded,
+          JSON.stringify(body),
+        );
+      } catch {
+        return undefined;
+      }
     },
 
     async waitFor(id: string, timeoutMs = 10_000): Promise<unknown[]> {

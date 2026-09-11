@@ -115,4 +115,67 @@ describe("createInterceptor", () => {
 
     expect(interceptor.getAll("ep")).toEqual([]);
   });
+
+  describe("replay", () => {
+    const REQUEST_ID = "__obc_request__";
+
+    function recordedPage(evaluateResult: unknown) {
+      const { page, simulateCapture } = mockPage();
+      const mainFrame = { url: () => "https://x.cl/", evaluate: vi.fn(async () => evaluateResult) };
+      Object.assign(page, { frames: () => [mainFrame], mainFrame: () => mainFrame });
+      return { page, simulateCapture, mainFrame };
+    }
+
+    it("explica que no hay peticion grabada", async () => {
+      const { page } = recordedPage(undefined);
+      const interceptor = await createInterceptor(page, [{ id: "ep", urlPrefix: "https://x.cl" }]);
+      expect(await interceptor.replay("ep", {})).toBeUndefined();
+      expect(interceptor.lastReplayError("ep")).toMatch(/sin peticion grabada/);
+    });
+
+    it("registra el estado HTTP cuando el banco rechaza el replay", async () => {
+      const { page, simulateCapture } = recordedPage({ ok: false, status: 401, data: { error: "x" } });
+      const interceptor = await createInterceptor(page, [{ id: "ep", urlPrefix: "https://x.cl" }]);
+      simulateCapture(REQUEST_ID, {
+        endpointId: "ep",
+        url: "https://x.cl/api",
+        method: "POST",
+        headers: {},
+        body: "{}",
+      });
+      await interceptor.replay("ep", {});
+      expect(interceptor.lastReplayError("ep")).toBe("HTTP 401");
+    });
+
+    it("limpia el error cuando el replay funciona", async () => {
+      const { page, simulateCapture } = recordedPage({ ok: true, status: 200, data: { ok: 1 } });
+      const interceptor = await createInterceptor(page, [{ id: "ep", urlPrefix: "https://x.cl" }]);
+      simulateCapture(REQUEST_ID, {
+        endpointId: "ep",
+        url: "https://x.cl/api",
+        method: "POST",
+        headers: {},
+        body: "{}",
+      });
+      expect(await interceptor.replay("ep", {})).toEqual({ ok: 1 });
+      expect(interceptor.lastReplayError("ep")).toBeUndefined();
+    });
+
+    it("repite la peticion desde el frame que la hizo, no desde el principal", async () => {
+      const { page, simulateCapture, mainFrame } = recordedPage({ ok: true, status: 200, data: 1 });
+      const modulo = { url: () => "https://modulo.x.cl/tarjetas", evaluate: vi.fn(async () => ({ ok: true, status: 200, data: 2 })) };
+      Object.assign(page, { frames: () => [mainFrame, modulo] });
+      const interceptor = await createInterceptor(page, [{ id: "ep", urlPrefix: "https://api.x.cl" }]);
+      simulateCapture(REQUEST_ID, {
+        endpointId: "ep",
+        url: "https://api.x.cl/api",
+        method: "POST",
+        headers: {},
+        body: "{}",
+        origin: "https://modulo.x.cl",
+      });
+      expect(await interceptor.replay("ep", {})).toBe(2);
+      expect(mainFrame.evaluate).not.toHaveBeenCalled();
+    });
+  });
 });

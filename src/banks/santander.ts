@@ -640,6 +640,14 @@ async function collectAllCards(
       `  ****${card.mask}: ${unbilled.length} por facturar, ` +
         `${billedCapture ? "extracto leido" : "sin extracto"}.`,
     );
+    for (const id of [
+      "santander-credit-card-unbilled",
+      "santander-cc-statements",
+      "santander-credit-card-billed",
+    ]) {
+      const failure = interceptor.lastReplayError(id);
+      if (failure) debugLog.push(`    replay ${id}: ${failure}`);
+    }
   }
 
   return { movements, creditCards };

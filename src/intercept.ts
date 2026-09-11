@@ -9,6 +9,14 @@ interface RecordedRequest {
   method: string;
   headers: Record<string, string>;
   body?: string;
+  /**
+   * Origen del documento que hizo la peticion. Los modulos del portal viven
+   * en iframes de otro subdominio: repetir la peticion desde el frame
+   * principal falla por CORS ("Failed to fetch") aunque la sesion este viva.
+   */
+  origin?: string;
+  /** `withCredentials` del XHR (o `credentials: "include"` del fetch). */
+  credentials?: boolean;
 }
 
 export interface EndpointConfig {
@@ -86,6 +94,11 @@ export interface Interceptor {
    * Devuelve la respuesta JSON, o `undefined` si no hay plantilla o si falló.
    */
   replay(id: string, body: unknown): Promise<unknown | undefined>;
+  /**
+   * Por qué falló el último `replay` de ese endpoint: estado HTTP y un trozo
+   * del cuerpo, o la excepción. `undefined` si el último replay funcionó.
+   */
+  lastReplayError(id: string): string | undefined;
 }
 
 /**
@@ -104,6 +117,7 @@ export async function createInterceptor(
 ): Promise<Interceptor> {
   const captures = new Map<string, unknown[]>();
   const requests = new Map<string, RecordedRequest>();
+  const replayErrors = new Map<string, string>();
 
   if (DUMP_DIR) mkdirSync(DUMP_DIR, { recursive: true, mode: 0o700 });
   let dumped = 0;
@@ -120,6 +134,8 @@ export async function createInterceptor(
             method: recorded.method,
             headers: recorded.headers,
             body: recorded.body,
+            origin: recorded.origin,
+            credentials: recorded.credentials,
           });
         } catch {
           // Sin plantilla no hay replay; el scraper sigue con lo que capturo.
@@ -211,11 +227,14 @@ export async function createInterceptor(
         method: string,
         headers: unknown,
         body: unknown,
+        credentials: boolean,
       ): void {
         capture(config.requestId, {
           endpointId,
           url,
           method,
+          origin: location.origin,
+          credentials,
           headers: plainHeaders(headers),
           body: typeof body === "string" ? body : undefined,
         });
@@ -261,7 +280,8 @@ export async function createInterceptor(
         if (ep || shouldDump(url)) {
           const init = (args[1] || {}) as RequestInit;
           const method = (init.method || (args[0] instanceof Request ? args[0].method : "GET")).toUpperCase();
-          if (ep) recordRequest(ep.id, url, method, init.headers, init.body);
+          const headers = init.headers ?? (args[0] instanceof Request ? args[0].headers : undefined);
+          if (ep) recordRequest(ep.id, url, method, headers, init.body, init.credentials === "include");
           response
             .clone()
             .json()
@@ -278,6 +298,7 @@ export async function createInterceptor(
       // ── Wrap XHR ────────────────────────────────────────────────
       const origOpen = XMLHttpRequest.prototype.open;
       const origSend = XMLHttpRequest.prototype.send;
+      const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
 
       XMLHttpRequest.prototype.open = function (
         method: string,
@@ -286,13 +307,14 @@ export async function createInterceptor(
       ): void {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const self = this as any;
-        self.__obcEp = matchEndpoint(String(url));
+        // Un XHR marcado por `replay` pasa de largo: si se capturara, el
+        // movimiento repetido se contaria dos veces.
+        self.__obcEp = self.__obcReplay ? undefined : matchEndpoint(String(url));
         self.__obcUrl = String(url);
         self.__obcMethod = method;
         return origOpen.apply(this, [method, url, ...rest] as Parameters<typeof origOpen>);
       };
 
-      const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
       XMLHttpRequest.prototype.setRequestHeader = function (name: string, value: string): void {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const self = this as any;
@@ -309,9 +331,16 @@ export async function createInterceptor(
         const url = (self.__obcUrl as string) || "";
         const requestBody = args[0];
         if (ep) {
-          recordRequest(ep.id, url, (self.__obcMethod as string) || "GET", self.__obcHeaders, requestBody);
+          recordRequest(
+            ep.id,
+            url,
+            (self.__obcMethod as string) || "GET",
+            self.__obcHeaders,
+            requestBody,
+            Boolean(this.withCredentials),
+          );
         }
-        if (ep || shouldDump(url)) {
+        if ((ep || shouldDump(url)) && !self.__obcReplay) {
           this.addEventListener("load", function (this: XMLHttpRequest) {
             try {
               const data: unknown =
@@ -357,26 +386,79 @@ export async function createInterceptor(
 
     async replay(id: string, body: unknown): Promise<unknown | undefined> {
       const recorded = requests.get(id);
-      if (!recorded) return undefined;
+      if (!recorded) {
+        replayErrors.set(id, "sin peticion grabada para ese endpoint");
+        return undefined;
+      }
+      // Se repite desde el mismo frame que la hizo: es el unico origen al que
+      // el banco le responde con CORS.
+      const frame =
+        page.frames().find((f) => {
+          try {
+            return recorded.origin !== undefined && new URL(f.url()).origin === recorded.origin;
+          } catch {
+            return false;
+          }
+        }) ?? page.mainFrame();
       try {
-        return await page.evaluate(
-          async (request: RecordedRequest, bodyJson: string) => {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const rawFetch = (window as any).__obcFetch as typeof fetch;
-            const response = await rawFetch(request.url, {
-              method: request.method,
-              headers: request.headers,
-              body: bodyJson,
-              credentials: "include",
-            });
-            return (await response.json()) as unknown;
-          },
+        // Se resuelve en la pagina y se devuelve el estado aparte: un 401 o
+        // un HTML de sesion caida tambien "responden", y sin el estado se
+        // confunden con un producto sin movimientos.
+        const outcome = await frame.evaluate(
+          (request: RecordedRequest, bodyJson: string) =>
+            new Promise<{ ok: boolean; status: number; data?: unknown; text?: string }>((resolve) => {
+              // XHR del propio realm de la pagina, con los metodos que haya
+              // en ese momento (los nuestros, los de zone.js): guardar los
+              // originales al cargar el documento no sirve, Chrome reutiliza
+              // la ventana del about:blank inicial y quedan de otro realm
+              // ("Illegal invocation").
+              const xhr = new XMLHttpRequest();
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              (xhr as any).__obcReplay = true;
+              xhr.open(request.method, request.url, true);
+              xhr.withCredentials = Boolean(request.credentials);
+              for (const [name, value] of Object.entries(request.headers)) {
+                try {
+                  xhr.setRequestHeader(name, value);
+                } catch {
+                  // Cabecera prohibida por el navegador: la pone el solo.
+                }
+              }
+              xhr.onload = () => {
+                const ok = xhr.status >= 200 && xhr.status < 300;
+                try {
+                  resolve({ ok, status: xhr.status, data: JSON.parse(xhr.responseText) as unknown });
+                } catch {
+                  resolve({ ok: false, status: xhr.status, text: xhr.responseText.slice(0, 300) });
+                }
+              };
+              xhr.onerror = () => resolve({ ok: false, status: xhr.status, text: "error de red" });
+              xhr.ontimeout = () => resolve({ ok: false, status: xhr.status, text: "timeout" });
+              xhr.send(request.method === "GET" ? null : bodyJson);
+            }),
           recorded,
           JSON.stringify(body),
         );
-      } catch {
+        if (!outcome.ok || outcome.data === undefined) {
+          replayErrors.set(
+            id,
+            `HTTP ${outcome.status}` + (outcome.text !== undefined ? ` cuerpo no JSON: ${outcome.text}` : ""),
+          );
+          return outcome.data;
+        }
+        replayErrors.delete(id);
+        return outcome.data;
+      } catch (err) {
+        replayErrors.set(
+          id,
+          `excepcion desde ${frame.url()}: ${err instanceof Error ? err.message : String(err)}`,
+        );
         return undefined;
       }
+    },
+
+    lastReplayError(id: string): string | undefined {
+      return replayErrors.get(id);
     },
 
     async waitFor(id: string, timeoutMs = 10_000): Promise<unknown[]> {

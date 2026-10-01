@@ -142,6 +142,20 @@ interface SantanderBilledApiMovement {
   NumeroCuotas: string; // "00"
   TotalCuotas: string; // "00"
   Pan?: string; // "240004#375833608" — el plastico que hizo la compra
+  CodTxs?: string; // "005" compra, "067" pago, "201" abono, "510" nota de credito
+  Glosa1?: string; // la glosa cuando NombreComercio viene vacio (traspasos a cuotas)
+}
+
+// El estado de cuenta no trae signo ni indicador debe/haber: todo llega como
+// monto positivo. Lo que distingue un abono es el codigo de transaccion, y como
+// respaldo la glosa. Antes solo "MONTO CANCELADO" se leia como abono, asi que
+// las notas de credito y el abono de un traspaso a cuotas llegaban como cargos.
+const BILLED_CREDIT_CODES = new Set(["067", "201", "510"]);
+const BILLED_CREDIT_NAME = /monto\s+cancelado|^\s*abono\b|nota\s+de\s+cr[eé]dito/i;
+
+export function isBilledCredit(m: { CodTxs?: string; NombreComercio?: string }): boolean {
+  if (m.CodTxs && BILLED_CREDIT_CODES.has(m.CodTxs.trim())) return true;
+  return BILLED_CREDIT_NAME.test(m.NombreComercio || "");
 }
 
 /** Ultimos cuatro digitos del PAN, que es como se nombra una tarjeta. */
@@ -166,8 +180,10 @@ export function normalizeSantanderBilledApiMovements(captures: unknown[]): BankM
       const raw = parseInt(cleaned, 10);
       if (!raw || isNaN(raw)) continue;
       if (isSaldoInicial(m.NombreComercio)) continue;
-      const isPayment = m.NombreComercio.toLowerCase().includes("monto cancelado");
-      const amount = isPayment ? raw : -raw;
+      const amount = isBilledCredit(m) ? raw : -raw;
+      // Las cuotas de un traspaso a cuotas traen NombreComercio en blanco y la
+      // glosa en Glosa1; sin esto llegaban como "(sin glosa)".
+      const description = (m.NombreComercio || "").trim() || (m.Glosa1 || "").trim();
       const totalCuotas = parseInt(m.TotalCuotas.replace(/^0+/, "") || "0", 10);
       const currentCuota = parseInt(m.NumeroCuotas.replace(/^0+/, "") || "0", 10);
       const installments =
@@ -177,7 +193,7 @@ export function normalizeSantanderBilledApiMovements(captures: unknown[]): BankM
       const card = maskOfPan(m.Pan);
       movements.push({
         date: normalizeDate(m.FechaTxs),
-        description: m.NombreComercio,
+        description,
         amount,
         balance: 0,
         source: MOVEMENT_SOURCE.credit_card_billed,

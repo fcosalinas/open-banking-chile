@@ -705,3 +705,64 @@ describe("withCardCoordinates", () => {
     expect(template.Entrada.Centro).toBe("0163");
   });
 });
+
+// ─── Abonos del estado de cuenta facturado ───────────────────────
+
+describe("normalizeSantanderBilledApiMovements · abonos", () => {
+  // Formas reales del estado de cuenta de la 3608 (junio-septiembre 2026). El
+  // banco no manda signo: el codigo de transaccion es lo que dice que es abono.
+  const capture = (items: object[]) => ({
+    DATA: { AS_TIB_WM02_CONEstCtaNacional_Response: { OUTPUT: { Matriz: items } } },
+  });
+  const base = { NumeroCuotas: "00", TotalCuotas: "00" };
+
+  it("una nota de credito es abono, no cargo", () => {
+    const [m] = normalizeSantanderBilledApiMovements([
+      capture([{ ...base, FechaTxs: "2026-09-23", NombreComercio: "NOTA DE CREDITO", MontoTxs: "0000023899", CodTxs: "510" }]),
+    ]);
+    expect(m.amount).toBe(23899);
+  });
+
+  it("el abono de un traspaso a cuotas es abono", () => {
+    const [m] = normalizeSantanderBilledApiMovements([
+      capture([{ ...base, FechaTxs: "2026-07-24", NombreComercio: "ABONO SALDO TRASPASADO C.CUO", MontoTxs: "0002893377", CodTxs: "201" }]),
+    ]);
+    expect(m.amount).toBe(2893377);
+  });
+
+  it("reconoce el abono por la glosa aunque falte el codigo", () => {
+    const [m] = normalizeSantanderBilledApiMovements([
+      capture([{ ...base, FechaTxs: "2026-08-04", NombreComercio: "Nota de Crédito", MontoTxs: "0000000123" }]),
+    ]);
+    expect(m.amount).toBe(123);
+  });
+
+  it("una compra y un traspaso a deuda nacional siguen siendo cargos", () => {
+    const result = normalizeSantanderBilledApiMovements([
+      capture([
+        { ...base, FechaTxs: "2026-07-27", NombreComercio: "STA ISABEL ONECLICK", MontoTxs: "0000063193", CodTxs: "005" },
+        { ...base, FechaTxs: "2026-08-14", NombreComercio: "TRASPASO A DEUDA NACIONAL", MontoTxs: "0000352657", CodTxs: "074" },
+      ]),
+    ]);
+    expect(result.map((m) => m.amount)).toEqual([-63193, -352657]);
+  });
+
+  it("toma la glosa de Glosa1 cuando el comercio viene en blanco", () => {
+    const [m] = normalizeSantanderBilledApiMovements([
+      capture([
+        {
+          FechaTxs: "2026-06-02",
+          NombreComercio: "                                        ",
+          MontoTxs: "0000897851",
+          NumeroCuotas: "03",
+          TotalCuotas: "03",
+          CodTxs: "205",
+          Glosa1: "TRASP A CUOTAS DEUDA NACIONAL",
+        },
+      ]),
+    ]);
+    expect(m.description).toBe("TRASP A CUOTAS DEUDA NACIONAL");
+    expect(m.amount).toBe(-897851);
+    expect(m.installments).toBe("03/03");
+  });
+});

@@ -31,6 +31,11 @@ const SANTANDER_CC_API_PREFIX =
   "https://api-dsk.santander.cl/perdsk/tarjetasDeCredito/consultaUltimosMovimientos";
 const SANTANDER_CC_BILLED_API_PREFIX =
   "https://api-dsk.santander.cl/perdsk/tarjetasDeCredito/estadoCuentaNacional";
+// Extracto en dolares. La interfaz solo lo pide si uno cambia la moneda a mano,
+// asi que nunca hay peticion grabada: se repite la del nacional contra esta URL
+// (mismo servicio, mismo cuerpo).
+const SANTANDER_CC_BILLED_USD_URL =
+  "https://api-dsk.santander.cl/perdsk/tarjetasDeCredito/estadoCuentaInternacional";
 // Lista de plasticos del cliente: de aca salen las coordenadas
 // (entidad/centro/cuenta) con las que se le puede preguntar al banco por cada
 // tarjeta. Sin esto solo se ve la que el portal muestra por omision.
@@ -205,6 +210,67 @@ export function normalizeSantanderBilledApiMovements(captures: unknown[]): BankM
   return movements;
 }
 
+interface SantanderInternationalApiMovement {
+  Pan?: string; // "240004#375833608"
+  SegmentoTxs?: string; // "01" compras, "03" traspasos/pagos
+  FechaTxs?: string; // "2026-10-02"
+  NombreComercio?: string;
+  Glosa1?: string | null;
+  CodTxs?: string;
+  MontoOrigen?: string; // en la moneda del comercio; no se usa
+  MontoTransaccion?: string; // "00000009831+": centavos de dolar, signo al final
+}
+
+/** Centavos de dolar con el signo al final: "00000009831+" → 98.31. */
+export function usdCents(raw: string | undefined): number | undefined {
+  const match = /^\s*(\d+)\s*([+-])?\s*$/.exec(raw || "");
+  if (!match) return undefined;
+  return parseInt(match[1], 10) / 100;
+}
+
+/**
+ * Movimientos del extracto en dolares.
+ *
+ * `MontoTransaccion` viene en centavos de dolar; `+` es cargo y `-` abono (el
+ * traspaso de deuda a pesos y los pagos). `MontoOrigen` esta en la moneda del
+ * comercio (pesos en Facebook, coronas en Spotify) y no sirve como monto.
+ * El traspaso a deuda nacional se deja pasar: contador lo empareja con su
+ * contrapartida en pesos y lo neutraliza (R2).
+ */
+export function normalizeSantanderInternationalApiMovements(captures: unknown[]): BankMovement[] {
+  const movements: BankMovement[] = [];
+  for (const capture of captures) {
+    const list = (
+      capture as {
+        DATA?: {
+          AS_TIB_WM03_CONEstCtaInternacional_Response?: {
+            OUTPUT?: { MATRIZDATOS?: SantanderInternationalApiMovement[] | null };
+          };
+        };
+      }
+    )?.DATA?.AS_TIB_WM03_CONEstCtaInternacional_Response?.OUTPUT?.MATRIZDATOS;
+    if (!Array.isArray(list)) continue;
+    for (const m of list) {
+      const value = usdCents(m.MontoTransaccion);
+      if (!value || !m.FechaTxs) continue;
+      const description = (m.NombreComercio || "").trim() || (m.Glosa1 || "").trim();
+      if (isSaldoInicial(description)) continue;
+      const credit = (m.MontoTransaccion || "").trim().endsWith("-");
+      const card = maskOfPan(m.Pan);
+      movements.push({
+        date: normalizeDate(m.FechaTxs),
+        description: description || "(sin glosa)",
+        amount: credit ? value : -value,
+        balance: 0,
+        source: MOVEMENT_SOURCE.credit_card_billed,
+        currency: "USD",
+        ...(card ? { card } : {}),
+      });
+    }
+  }
+  return movements;
+}
+
 // ─── Tarjetas: lista de plasticos y extractos ────────────────────
 
 interface SantanderCardDevice {
@@ -309,6 +375,25 @@ export function latestStatementNumber(capture: unknown): string | undefined {
   return clp[clp.length - 1].NUMEXT;
 }
 
+/**
+ * Numeros de todos los extractos en dolares disponibles, del mas antiguo al
+ * mas reciente. El banco lista unos doce meses y en dolares hay pocas compras
+ * por extracto, asi que se piden todos para tener el año completo.
+ */
+export function usdStatementNumbers(capture: unknown): string[] {
+  const matrix = (
+    capture as {
+      DATA?: {
+        AS_TIB_WM01_CONCuentasDisponibles?: { OUTPUT?: { MATRIZ?: SantanderStatementRef[] } };
+      };
+    }
+  )?.DATA?.AS_TIB_WM01_CONCuentasDisponibles?.OUTPUT?.MATRIZ;
+  if (!Array.isArray(matrix)) return [];
+  const usd = matrix.filter((row) => row.MONEDA === "840" && row.NUMEXT);
+  usd.sort((a, b) => (a.FECHAEXT || "").localeCompare(b.FECHAEXT || ""));
+  return [...new Set(usd.map((row) => row.NUMEXT as string))];
+}
+
 interface SantanderStatementHeader {
   CupoPesos?: string;
   MontoUtilizado?: string;
@@ -399,6 +484,7 @@ export function withCardCoordinates(
     codentidad: card.entity,
     centro: card.center,
     centalt: card.center,
+    centalta: card.center,
     centroalt: card.center,
     cuenta: card.account,
     ...Object.fromEntries(Object.entries(extra).map(([key, value]) => [key.toLowerCase(), value])),
@@ -416,6 +502,66 @@ export function withCardCoordinates(
   };
   patch(clone);
   return clone;
+}
+
+// Canal con que el portal pide el extracto en dolares. El nacional los manda
+// vacios; el internacional los exige.
+const USD_CANAL_FISICO = "78";
+const USD_CANAL_LOGICO = "74";
+
+/**
+ * Cuerpo para el extracto en dolares, armado igual que el que manda el portal.
+ *
+ * Se toma la cabecera del nacional grabado (RUT y usuario de la sesion) y se
+ * arma INPUT con exactamente los campos del internacional: el banco rechaza
+ * con "Por favor validar datos ingresados" (codigo 16) si llegan `CentAlt` o
+ * `FILLER` del nacional, o los canales vacios.
+ */
+export function internationalStatementBody(
+  nationalTemplate: unknown,
+  card: SantanderCard,
+  statementNumber: string,
+): unknown {
+  const template = (nationalTemplate ?? {}) as {
+    cabecera?: Record<string, unknown>;
+    INPUT?: Record<string, unknown>;
+  };
+  const cabecera = JSON.parse(JSON.stringify(template.cabecera ?? {})) as Record<string, unknown>;
+  if (!cabecera.CanalFisico) cabecera.CanalFisico = USD_CANAL_FISICO;
+  if (!cabecera.CanalLogico) cabecera.CanalLogico = USD_CANAL_LOGICO;
+  const input = template.INPUT ?? {};
+  const text = (key: string) => (typeof input[key] === "string" ? (input[key] as string) : "");
+  return {
+    cabecera,
+    INPUT: {
+      "USUARIO-ALT": text("USUARIO-ALT"),
+      "TERMINAL-ALT": text("TERMINAL-ALT"),
+      "CANAL-ID": text("CANAL-ID"),
+      CodEnt: card.entity,
+      CentAlta: card.center,
+      Cuenta: card.account,
+      Pan: "",
+      NumExtracto: statementNumber,
+      NumMov: "",
+      FilasRecuperar: "",
+      "ID-RECALL": "",
+    },
+  };
+}
+
+/** Codigo y mensaje del banco en una respuesta del extracto en dolares. */
+export function internationalStatementStatus(capture: unknown): string | undefined {
+  const info = (
+    capture as {
+      DATA?: {
+        AS_TIB_WM03_CONEstCtaInternacional_Response?: {
+          Informacion?: { Codigo?: string; Mensaje?: string };
+        };
+      };
+    }
+  )?.DATA?.AS_TIB_WM03_CONEstCtaInternacional_Response?.Informacion;
+  if (!info?.Codigo) return undefined;
+  return `${info.Codigo} ${info.Mensaje ?? ""}`.trim();
 }
 
 // Sidebar menu IDs — generated by Santander's Angular framework, may change
@@ -700,6 +846,35 @@ async function collectAllCards(
         if (billedCapture) {
           movements.push(...normalizeSantanderBilledApiMovements([billedCapture]));
         }
+      }
+
+      const usdNumbers = statements ? usdStatementNumbers(statements) : [];
+      let usdRead = 0;
+      let usdCount = 0;
+      const usdRejected = new Set<string>();
+      for (const number of usdNumbers) {
+        const usdCapture = await interceptor.replay(
+          "santander-credit-card-billed",
+          internationalStatementBody(billedTemplate, card, number),
+          { url: SANTANDER_CC_BILLED_USD_URL },
+        );
+        if (!usdCapture) continue;
+        const status = internationalStatementStatus(usdCapture);
+        if (status && !status.startsWith("00")) {
+          // Un rechazo del banco no es "extracto vacio": se anota el codigo.
+          usdRejected.add(status);
+          continue;
+        }
+        usdRead += 1;
+        const usd = normalizeSantanderInternationalApiMovements([usdCapture]);
+        usdCount += usd.length;
+        movements.push(...usd);
+      }
+      if (usdNumbers.length > 0) {
+        debugLog.push(
+          `  ****${card.mask}: ${usdRead}/${usdNumbers.length} extracto(s) USD, ${usdCount} movimiento(s)` +
+            (usdRejected.size > 0 ? `; rechazados por el banco: ${[...usdRejected].join(" / ")}.` : "."),
+        );
       }
     }
 

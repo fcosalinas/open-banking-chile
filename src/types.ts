@@ -35,6 +35,8 @@ export interface BankMovement {
   installments?: string;
   /** Monto total de la compra (distinto de amount cuando es en cuotas) */
   totalAmount?: number;
+  /** Moneda del monto; si falta es CLP. En USD trae decimales (98.31). */
+  currency?: "CLP" | "USD";
 }
 
 /** Saldo y movimientos de una cuenta bancaria */

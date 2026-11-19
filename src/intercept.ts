@@ -93,12 +93,22 @@ export interface Interceptor {
    *
    * Devuelve la respuesta JSON, o `undefined` si no hay plantilla o si falló.
    */
-  replay(id: string, body: unknown): Promise<unknown | undefined>;
+  replay(id: string, body: unknown, options?: ReplayOptions): Promise<unknown | undefined>;
   /**
    * Por qué falló el último `replay` de ese endpoint: estado HTTP y un trozo
    * del cuerpo, o la excepción. `undefined` si el último replay funcionó.
    */
   lastReplayError(id: string): string | undefined;
+}
+
+/** Ajustes de un `replay`. */
+export interface ReplayOptions {
+  /**
+   * Otra URL del mismo servicio. Sirve para endpoints que la interfaz casi
+   * nunca pide (el extracto en dolares) pero que aceptan la misma sesion,
+   * cabeceras y origen que uno que si se grabo.
+   */
+  url?: string;
 }
 
 /**
@@ -384,8 +394,9 @@ export async function createInterceptor(
       }
     },
 
-    async replay(id: string, body: unknown): Promise<unknown | undefined> {
-      const recorded = requests.get(id);
+    async replay(id: string, body: unknown, options?: ReplayOptions): Promise<unknown | undefined> {
+      const grabada = requests.get(id);
+      const recorded = grabada && options?.url ? { ...grabada, url: options.url } : grabada;
       if (!recorded) {
         replayErrors.set(id, "sin peticion grabada para ese endpoint");
         return undefined;

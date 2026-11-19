@@ -4,8 +4,12 @@ import {
   buildSantanderCreditCard,
   cardAccounts,
   isSaldoInicial,
+  internationalStatementBody,
+  internationalStatementStatus,
   latestStatementNumber,
   maskOfPan,
+  normalizeSantanderInternationalApiMovements,
+  usdStatementNumbers,
   normalizeSantanderCheckingApiMovements,
   normalizeSantanderUnbilledApiMovements,
   normalizeSantanderBilledApiMovements,
@@ -586,6 +590,129 @@ describe("latestStatementNumber", () => {
 
   it("devuelve undefined si no hay extractos", () => {
     expect(latestStatementNumber({})).toBeUndefined();
+  });
+});
+
+describe("usdStatementNumbers", () => {
+  it("lista los extractos en dólares del más antiguo al más reciente", () => {
+    const capture = {
+      DATA: {
+        AS_TIB_WM01_CONCuentasDisponibles: {
+          OUTPUT: {
+            MATRIZ: [
+              { NUMEXT: "078", FECHAEXT: "2026-10-26", MONEDA: "840" },
+              { NUMEXT: "082", FECHAEXT: "2026-10-26", MONEDA: "152" },
+              { NUMEXT: "077", FECHAEXT: "2026-09-24", MONEDA: "840" },
+            ],
+          },
+        },
+      },
+    };
+    expect(usdStatementNumbers(capture)).toEqual(["077", "078"]);
+  });
+
+  it("devuelve vacío sin extractos", () => {
+    expect(usdStatementNumbers({})).toEqual([]);
+    expect(usdStatementNumbers(STATEMENTS)).toEqual(["040"]);
+  });
+});
+
+// ─── Extracto en dólares ─────────────────────────────────────────
+
+describe("normalizeSantanderInternationalApiMovements", () => {
+  const capture = (rows: object[] | null) => ({
+    DATA: {
+      AS_TIB_WM03_CONEstCtaInternacional_Response: { OUTPUT: { MATRIZDATOS: rows } },
+    },
+  });
+
+  it("lee centavos de dólar con signo al final y marca la moneda", () => {
+    const [m] = normalizeSantanderInternationalApiMovements([
+      capture([
+        {
+          Pan: "240004#375833608",
+          FechaTxs: "2026-10-02",
+          NombreComercio: "MONGODBCLOUD SURMET...",
+          MontoOrigen: "00000009831+",
+          MontoTransaccion: "00000009831+",
+        },
+      ]),
+    ]);
+    expect(m).toMatchObject({
+      date: "2026-10-02",
+      description: "MONGODBCLOUD SURMET...",
+      amount: -98.31,
+      currency: "USD",
+      card: "3608",
+      source: MOVEMENT_SOURCE.credit_card_billed,
+    });
+  });
+
+  it("usa el monto en dólares, no el de la moneda del comercio", () => {
+    const [m] = normalizeSantanderInternationalApiMovements([
+      capture([
+        { FechaTxs: "2026-09-30", NombreComercio: "FACEBK *4VNF4AJRE4", MontoOrigen: "00000343200+", MontoTransaccion: "00000000353+" },
+      ]),
+    ]);
+    expect(m.amount).toBe(-3.53);
+  });
+
+  it("el traspaso a deuda nacional es abono", () => {
+    const [m] = normalizeSantanderInternationalApiMovements([
+      capture([
+        { FechaTxs: "2026-10-09", NombreComercio: "TRASPASO DE DEUDA INTERNACIO", MontoOrigen: "00000000000+", MontoTransaccion: "00000029825-" },
+      ]),
+    ]);
+    expect(m.amount).toBe(298.25);
+  });
+
+  it("no se cae con un extracto vacío", () => {
+    expect(normalizeSantanderInternationalApiMovements([capture(null), {}])).toEqual([]);
+  });
+});
+
+describe("internationalStatementBody", () => {
+  // Lo que graba el portal al pedir el extracto nacional...
+  const nacional = {
+    cabecera: {
+      HOST: { "USUARIO-ALT": "GHOBP", "TERMINAL-ALT": "", "CANAL-ID": "003" },
+      CanalFisico: "",
+      CanalLogico: "",
+      RutCliente: "00011111111",
+      RutUsuario: "00011111111",
+      InfoDispositivo: "InfoDispositivo",
+    },
+    INPUT: {
+      "USUARIO-ALT": "GHOBP", "TERMINAL-ALT": "", "CANAL-ID": "003", FILLER: "",
+      CodEnt: "0035", CentAlt: "0163", Cuenta: "800058891141", Pan: "",
+      NumExtracto: "090", NumMov: "", FilasRecuperar: "", "ID-RECALL": "",
+    },
+  };
+  const card = { entity: "0035", center: "0263", account: "800059383201", mask: "3608", label: "x", owner: "titular" as const };
+
+  it("arma el cuerpo igual que el portal (con otro, el banco contesta codigo 16)", () => {
+    // ...y lo que manda el portal cuando uno elige "Dólares" (captura del 19-11-2026).
+    expect(internationalStatementBody(nacional, card, "078")).toEqual({
+      cabecera: { ...nacional.cabecera, CanalFisico: "78", CanalLogico: "74" },
+      INPUT: {
+        "USUARIO-ALT": "GHOBP", "TERMINAL-ALT": "", "CANAL-ID": "003",
+        CodEnt: "0035", CentAlta: "0263", Cuenta: "800059383201", Pan: "",
+        NumExtracto: "078", NumMov: "", FilasRecuperar: "", "ID-RECALL": "",
+      },
+    });
+    expect(nacional.cabecera.CanalFisico).toBe("");
+  });
+
+  it("lee el código con que el banco rechaza", () => {
+    const rechazo = {
+      DATA: {
+        AS_TIB_WM03_CONEstCtaInternacional_Response: {
+          Informacion: { Codigo: "16", Mensaje: "Por favor validar datos ingresados" },
+        },
+      },
+    };
+    expect(internationalStatementStatus(rechazo)).toBe("16 Por favor validar datos ingresados");
+    expect(internationalStatementStatus({})).toBeUndefined();
   });
 });
 

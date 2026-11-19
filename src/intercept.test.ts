@@ -177,5 +177,25 @@ describe("createInterceptor", () => {
       expect(await interceptor.replay("ep", {})).toBe(2);
       expect(mainFrame.evaluate).not.toHaveBeenCalled();
     });
+
+    it("puede repetir contra otra URL con la misma sesion", async () => {
+      const { page, simulateCapture, mainFrame } = recordedPage({ ok: true, status: 200, data: 1 });
+      const interceptor = await createInterceptor(page, [{ id: "ep", urlPrefix: "https://x.cl" }]);
+      simulateCapture(REQUEST_ID, {
+        endpointId: "ep",
+        url: "https://x.cl/nacional",
+        method: "POST",
+        headers: { authorization: "t" },
+        body: "{}",
+      });
+      await interceptor.replay("ep", {}, { url: "https://x.cl/internacional" });
+      const calls = mainFrame.evaluate.mock.calls as unknown as unknown[][];
+      const first = calls[0][1] as { url: string; headers: object };
+      expect(first.url).toBe("https://x.cl/internacional");
+      expect(first.headers).toEqual({ authorization: "t" });
+      // la grabada queda intacta para el proximo replay
+      await interceptor.replay("ep", {});
+      expect((calls[1][1] as { url: string }).url).toBe("https://x.cl/nacional");
+    });
   });
 });

@@ -505,6 +505,58 @@ async function selectMovementAccount(page: Page, index: number): Promise<boolean
   return (await verify()) === index;
 }
 
+/**
+ * Espera a que el portal privado termine de cargar antes de navegar.
+ *
+ * Tras el submit el scraper esperaba 7 s fijos y daba el login por bueno si no
+ * habia mensaje de error. En noviembre de 2026 eso ya no alcanzaba: la captura
+ * "03-post-login" mostraba todavia la portada publica, la busqueda de
+ * Cuentas -> Movimientos fallaba al instante y la cuenta corriente quedaba sin
+ * leer, aunque segundos despues el menu estaba ahi.
+ */
+async function waitForDashboard(page: Page, debugLog: string[], timeoutMs = 45_000): Promise<boolean> {
+  const started = Date.now();
+  try {
+    const handle = await page.waitForFunction(
+      (cuentasId: string, maxX: number) => {
+        if (document.querySelector(cuentasId)) return "id";
+        const items = Array.from(document.querySelectorAll("a, button, li, span"));
+        for (const item of items) {
+          const el = item as HTMLElement;
+          if (el.innerText?.trim().toLowerCase() !== "cuentas") continue;
+          const rect = el.getBoundingClientRect();
+          if (rect.width > 0 && rect.x <= maxX) return "texto";
+        }
+        return false;
+      },
+      { timeout: timeoutMs, polling: 500 },
+      SIDEBAR.cuentas,
+      SIDEBAR.maxX,
+    );
+    const via = await handle.jsonValue();
+    debugLog.push(`  Portal listo en ${Math.round((Date.now() - started) / 1000)} s (menu por ${via}).`);
+    return true;
+  } catch {
+    const frames = page.frames().map((f) => f.url()).filter((u) => u && u !== "about:blank");
+    debugLog.push(
+      `  Portal sin menu Cuentas tras ${Math.round(timeoutMs / 1000)} s. URL: ${page.url()} | frames: ${frames.join(" , ")}`,
+    );
+    return false;
+  }
+}
+
+/**
+ * Saldo disponible de la cuenta corriente leido desde la portada.
+ *
+ * Hay que leerlo aqui y no al final: al terminar, la pagina abierta es la de
+ * tarjetas y el extractor generico tomaba el primer monto que encontraba. El
+ * 19-11-2026 guardo el disponible de la ****5394 ($3.386.759) como saldo de la
+ * cuenta, que tenia $275.645.
+ */
+async function extractDashboardBalance(page: Page): Promise<number | undefined> {
+  return extractBalance(page, [/cuenta corriente[\s\S]{0,80}?disponible\s*\$\s*([\d.]+)/i], []);
+}
+
 async function navigateToMovements(page: Page, debugLog: string[]): Promise<void> {
   // Try sidebar: Cuentas → Movimientos
   const cuentasClicked = await clickSidebarItem(
@@ -776,6 +828,14 @@ async function scrapeSantander(
   debugLog.push("6. Login OK.");
   progress("Sesión iniciada correctamente");
   await closePopups(page);
+  if (await waitForDashboard(page, debugLog)) {
+    // El portal recien cargado puede abrir sus propios avisos.
+    await closePopups(page);
+  }
+  const dashboardBalance = await extractDashboardBalance(page);
+  if (dashboardBalance !== undefined) {
+    debugLog.push(`  Saldo cuenta corriente en portada: $${dashboardBalance.toLocaleString("es-CL")}`);
+  }
 
   // 7. Navigate to movements
   debugLog.push("7. Navigating to movements...");
@@ -877,7 +937,9 @@ async function scrapeSantander(
     debugLog.push(`  Balance from movements: $${balance.toLocaleString("es-CL")}`);
   }
   if (balance === undefined || balance === 0) {
-    balance = await extractBalance(page);
+    // Nunca el extractor generico sobre la pagina actual: a esta altura es la
+    // de tarjetas y lo que encuentra es un cupo, no el saldo de la cuenta.
+    balance = dashboardBalance;
   }
 
   debugLog.push(`8. Extracted ${movements.length} movement(s)`);
